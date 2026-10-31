@@ -1,4 +1,6 @@
+mod ddc;
 mod hypr;
+mod screens;
 
 use gtk::prelude::*;
 use gtk_layer_shell::{KeyboardMode, Layer, LayerShell};
@@ -11,7 +13,7 @@ use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 const PANEL_WIDTH: i32 = 460;
 const PANEL_HEIGHT: i32 = 300;
-const USAGE: &str = "usage: fader <daemon|panel|list>";
+const USAGE: &str = "usage: fader <daemon|panel|list|get SCREEN>";
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -29,6 +31,16 @@ enum Error {
     NoHyprland,
     #[error("unexpected reply from Hyprland: {0}")]
     HyprlandReply(serde_json::Error),
+    #[error("ddcutil is not installed")]
+    NoDdcutil,
+    #[error("ddcutil did not answer in time")]
+    DdcTimeout,
+    #[error("{0}")]
+    Ddc(String),
+    #[error("unknown screen: {0}")]
+    UnknownScreen(String),
+    #[error("{id}: {reason}")]
+    ScreenUnavailable { id: String, reason: String },
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -41,6 +53,7 @@ fn main() -> ExitCode {
         ["daemon"] => daemon(),
         ["panel"] => send("panel"),
         ["list"] => list(),
+        ["get", screen] => get(screen),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -59,9 +72,27 @@ fn main() -> ExitCode {
 
 fn list() -> Result<(), Error> {
     let mut out = io::stdout().lock();
-    for monitor in hypr::monitors()? {
-        let state = if monitor.disabled { "\tdisabled" } else { "" };
-        writeln!(out, "{}\t{}{state}", monitor.name, monitor.label())?;
+    for s in screens::read(None)? {
+        let value = s.value.map_or("-".to_owned(), |v| format!("{v}%"));
+        let reason = s
+            .reason
+            .map_or(String::new(), |r| format!("\t{}", r.replace('\n', " ")));
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{value}\t{}{reason}",
+            s.id, s.label, s.backend, s.status
+        )?;
+    }
+    Ok(())
+}
+
+fn get(id: &str) -> Result<(), Error> {
+    for s in screens::read(Some(id))? {
+        let Some(value) = s.value else {
+            let reason = s.reason.unwrap_or_else(|| s.status.to_string());
+            return Err(Error::ScreenUnavailable { id: s.id, reason });
+        };
+        writeln!(io::stdout(), "{value}")?;
     }
     Ok(())
 }

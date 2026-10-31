@@ -14,6 +14,7 @@ pub struct Monitor {
     pub name: String,
     pub make: String,
     pub model: String,
+    pub serial: String,
     pub disabled: bool,
 }
 
@@ -70,7 +71,7 @@ mod tests {
             "make": "AOC", "model": "Q27B35E", "serial": "2S6S3HA016250", "width": 2560,
             "activeWorkspace": {"id": 4, "name": "4"}, "focused": true, "disabled": false},
             {"id": 1, "name": "DP-2", "make": "Samsung Electric Company", "model": "LC32G5xT",
-            "disabled": true}]"#;
+            "serial": "", "disabled": true}]"#;
 
         let monitors = parse_monitors(reply).unwrap();
 
