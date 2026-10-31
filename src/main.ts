@@ -1,6 +1,6 @@
 import { mount } from "svelte";
-import "../docs/design/fader-tokens.css";
 import App from "./App.svelte";
+import "./fader-tokens.css";
 
 const target = document.getElementById("app");
 if (!target) throw new Error("#app introuvable");
