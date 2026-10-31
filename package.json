@@ -8,6 +8,7 @@
     "dev": "vite dev",
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "node --test \"src/**/*.test.ts\"",
     "lint": "eslint . && prettier --check . \"!*.md\"",
     "format": "prettier --write . \"!*.md\"",
     "tauri": "tauri"
@@ -25,5 +26,8 @@
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.72.1",
     "vite": "^8.0.16"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.4"
   }
 }

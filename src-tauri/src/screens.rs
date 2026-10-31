@@ -1,17 +1,20 @@
 use crate::ddc::Brightness;
-use crate::hypr::Monitor;
+use crate::hypr::{Geometry, Monitor};
 use crate::i18n::t;
 use crate::{Error, backlight, ddc, hypr};
+use serde::Serialize;
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Backend {
     Backlight { device: String },
     Ddc { bus: u32 },
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Status {
     Ok,
     Busy,
@@ -19,10 +22,11 @@ pub enum Status {
     Permission,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Screen {
     pub id: String,
     pub label: String,
+    pub geometry: Geometry,
     pub backend: Backend,
     pub value: Option<u8>,
     pub max: Option<u32>,
@@ -120,6 +124,7 @@ fn read_screen(monitor: &Monitor, detected: &Result<Vec<ddc::Display>, Error>) -
         Ok(brightness) => Screen {
             id: monitor.name.clone(),
             label: monitor.label(),
+            geometry: monitor.geometry(),
             backend,
             value: Some(brightness.percent()),
             max: Some(brightness.max),
@@ -184,6 +189,7 @@ fn unavailable(monitor: &Monitor, backend: Backend, status: Status, reason: Stri
     Screen {
         id: monitor.name.clone(),
         label: monitor.label(),
+        geometry: monitor.geometry(),
         backend,
         value: None,
         max: None,
@@ -204,6 +210,11 @@ mod tests {
             serial: serial.into(),
             focused: false,
             disabled: false,
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            transform: 0,
         }
     }
 

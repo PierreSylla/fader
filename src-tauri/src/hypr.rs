@@ -1,5 +1,5 @@
 use crate::Error;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -15,11 +15,39 @@ pub struct Monitor {
     pub serial: String,
     pub focused: bool,
     pub disabled: bool,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub transform: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Geometry {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl Monitor {
     pub fn label(&self) -> String {
         format!("{} {}", self.make, self.model)
+    }
+
+    /// Odd transforms rotate the output by 90 or 270 degrees.
+    pub fn geometry(&self) -> Geometry {
+        let (width, height) = if self.transform % 2 == 1 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+        Geometry {
+            x: self.x,
+            y: self.y,
+            width,
+            height,
+        }
     }
 }
 
@@ -124,9 +152,11 @@ mod tests {
         // Real excerpt, Hyprland 0.56.2.
         let reply = r#"[{"id": 0, "name": "DP-1", "description": "AOC Q27B35E 2S6S3HA016250",
             "make": "AOC", "model": "Q27B35E", "serial": "2S6S3HA016250", "width": 2560,
+            "height": 1440, "x": 5120, "y": 0, "transform": 0,
             "activeWorkspace": {"id": 4, "name": "4"}, "focused": true, "disabled": false},
             {"id": 1, "name": "DP-2", "make": "Samsung Electric Company", "model": "LC32G5xT",
-            "serial": "", "focused": false, "disabled": true}]"#;
+            "serial": "", "focused": false, "disabled": true,
+            "x": 0, "y": 0, "width": 1440, "height": 2560, "transform": 1}]"#;
 
         let monitors = parse_monitors(reply).unwrap();
 
@@ -135,6 +165,9 @@ mod tests {
         assert_eq!(monitors[1].label(), "Samsung Electric Company LC32G5xT");
         assert!(!monitors[0].disabled);
         assert!(monitors[1].disabled);
+        assert_eq!(monitors[0].geometry().width, 2560);
+        assert_eq!(monitors[1].geometry().width, 2560);
+        assert_eq!(monitors[1].geometry().height, 1440);
     }
 
     #[test]

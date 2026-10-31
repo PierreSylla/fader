@@ -162,6 +162,10 @@ impl Engine {
         }
     }
 
+    pub fn screens(&self) -> Vec<Screen> {
+        self.lock().iter().map(Entry::view).collect()
+    }
+
     pub fn list(&self) -> String {
         self.lock().iter().map(|e| format_line(&e.view())).collect()
     }
@@ -297,6 +301,12 @@ mod tests {
         Screen {
             id: id.into(),
             label: "AOC Q27B35E".into(),
+            geometry: crate::hypr::Geometry {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+            },
             backend: if value.is_some() {
                 Backend::Ddc { bus: 9 }
             } else {
