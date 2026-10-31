@@ -1,3 +1,5 @@
+mod hypr;
+
 use gtk::prelude::*;
 use gtk_layer_shell::{KeyboardMode, Layer, LayerShell};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
@@ -9,7 +11,7 @@ use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 const PANEL_WIDTH: i32 = 460;
 const PANEL_HEIGHT: i32 = 300;
-const USAGE: &str = "usage: fader <daemon|panel>";
+const USAGE: &str = "usage: fader <daemon|panel|list>";
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -23,6 +25,10 @@ enum Error {
     NoDisplay,
     #[error("this compositor does not support the layer-shell protocol")]
     NoLayerShell,
+    #[error("cannot reach Hyprland, is it running in this session?")]
+    NoHyprland,
+    #[error("unexpected reply from Hyprland: {0}")]
+    HyprlandReply(serde_json::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -34,6 +40,7 @@ fn main() -> ExitCode {
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["daemon"] => daemon(),
         ["panel"] => send("panel"),
+        ["list"] => list(),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -41,11 +48,22 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        // `fader list | head` : le lecteur a fini, ce n'est pas une erreur.
+        Err(Error::Io(e)) if e.kind() == ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("fader: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn list() -> Result<(), Error> {
+    let mut out = io::stdout().lock();
+    for monitor in hypr::monitors()? {
+        let state = if monitor.disabled { "\tdisabled" } else { "" };
+        writeln!(out, "{}\t{}{state}", monitor.name, monitor.label())?;
+    }
+    Ok(())
 }
 
 fn socket_path() -> Result<PathBuf, Error> {
