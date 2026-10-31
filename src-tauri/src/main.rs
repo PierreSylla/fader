@@ -23,6 +23,8 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 pub enum Error {
     #[error("{}", t("XDG_RUNTIME_DIR is not set"))]
     NoRuntimeDir,
+    #[error("{}", t("HOME is not set"))]
+    NoHome,
     #[error("{}", t("fader daemon is already running"))]
     AlreadyRunning,
     #[error("{}", t("fader daemon is not running, start it with: fader daemon"))]

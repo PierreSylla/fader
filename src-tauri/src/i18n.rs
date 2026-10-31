@@ -15,6 +15,7 @@ const FR: &[(&str, &str)] = &[
         "XDG_RUNTIME_DIR is not set",
         "XDG_RUNTIME_DIR n'est pas défini",
     ),
+    ("HOME is not set", "HOME n'est pas défini"),
     (
         "fader daemon is already running",
         "le daemon fader est déjà lancé",

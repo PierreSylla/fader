@@ -1,7 +1,8 @@
+use crate::ddc::Brightness;
 use crate::queue::Queue;
 use crate::screens::{self, Backend, Screen, Status};
 use crate::{Error, hypr};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,31 +42,43 @@ fn to_raw(percent: u8, max: u32) -> u32 {
     raw.min(u64::from(max)) as u32
 }
 
+type Listener = Arc<dyn Fn() + Send + Sync>;
+
 struct Entry {
     screen: Screen,
     queue: Option<Queue>,
     last_set: Option<Instant>,
+    applied: Option<u8>,
 }
 
 impl Entry {
-    fn new(screen: Screen) -> Self {
+    fn new(screen: Screen, listener: &Listener) -> Self {
         let queue = screen.writable().then(|| {
             let backend = screen.backend.clone();
-            Queue::new(move |raw| screens::write(&backend, raw))
+            let listener = Arc::clone(listener);
+            Queue::new(move |raw| screens::write(&backend, raw), move || listener())
         });
         Self {
             screen,
             queue,
             last_set: None,
+            applied: None,
         }
     }
 
     fn view(&self) -> Screen {
         let mut screen = self.screen.clone();
         if let Some(queue) = &self.queue {
+            let applied = queue
+                .written()
+                .zip(screen.max)
+                .map(|(current, max)| Brightness { current, max }.percent())
+                .or(self.applied);
             if queue.busy() {
                 screen.status = Status::Busy;
+                screen.applied = applied;
             } else if let Some(error) = queue.error() {
+                screen.value = applied.or(screen.value);
                 screen.status = screens::status_of(&error);
                 screen.reason = Some(error);
             }
@@ -80,17 +93,55 @@ impl Entry {
     }
 }
 
-#[derive(Default)]
 pub struct Engine {
     entries: Mutex<Vec<Entry>>,
+    listener: Listener,
+    ready: Mutex<bool>,
+    became_ready: Condvar,
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new(|| {})
+    }
 }
 
 impl Engine {
+    pub fn new(listener: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            entries: Mutex::default(),
+            listener: Arc::new(listener),
+            ready: Mutex::new(false),
+            became_ready: Condvar::new(),
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        *self.ready.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn wait_ready(&self) {
+        let mut ready = self.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*ready {
+            ready = self
+                .became_ready
+                .wait(ready)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, Vec<Entry>> {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn refresh(&self, only: Option<&str>) -> Result<(), Error> {
+        let result = self.reload(only);
+        *self.ready.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.became_ready.notify_all();
+        result
+    }
+
+    fn reload(&self, only: Option<&str>) -> Result<(), Error> {
         let started = Instant::now();
         let fresh = screens::read(only)?;
         let mut entries = self.lock();
@@ -100,7 +151,7 @@ impl Engine {
                 .iter()
                 .position(|e| e.screen.id == screen.id && e.screen.backend == screen.backend);
             let Some(mut entry) = same.map(|i| previous.swap_remove(i)) else {
-                entries.push(Entry::new(screen));
+                entries.push(Entry::new(screen, &self.listener));
                 continue;
             };
             let keep_value = entry.value_is_newer_than(started);
@@ -112,7 +163,7 @@ impl Engine {
             if entry.queue.is_none() {
                 entry = Entry {
                     last_set: entry.last_set,
-                    ..Entry::new(entry.screen)
+                    ..Entry::new(entry.screen, &self.listener)
                 };
             }
             entries.push(entry);
@@ -200,17 +251,23 @@ impl Engine {
         for entry in entries.iter_mut().filter(|e| wanted(&e.screen.id)) {
             matched = true;
             let (Some(current), Some(max), Some(queue)) =
-                (entry.screen.value, entry.screen.max, &entry.queue)
+                (entry.view().value, entry.screen.max, &entry.queue)
             else {
                 failures.push(unavailable(entry.view()).to_string());
                 continue;
             };
             let value = adjust.apply(current);
+            if !queue.busy() {
+                queue.reset_written();
+                entry.applied = Some(current);
+            }
             queue.submit(to_raw(value, max));
             entry.screen.value = Some(value);
             entry.last_set = Some(Instant::now());
             output.push_str(&format!("{}\t{value}\n", entry.screen.id));
         }
+        drop(entries);
+        (self.listener)();
         if !matched {
             let id = match target {
                 Target::Screen(name) => name.clone(),
@@ -313,6 +370,7 @@ mod tests {
                 Backend::None
             },
             value,
+            applied: None,
             max: value.map(|_| 100),
             status: if value.is_some() {
                 Status::Ok
@@ -327,14 +385,15 @@ mod tests {
         let entries = screens
             .into_iter()
             .map(|screen| Entry {
-                queue: screen.writable().then(|| Queue::new(|_| Ok(()))),
+                queue: screen.writable().then(|| Queue::silent(|_| Ok(()))),
                 screen,
                 last_set: None,
+                applied: None,
             })
             .collect();
-        Engine {
-            entries: Mutex::new(entries),
-        }
+        let engine = Engine::default();
+        *engine.lock() = entries;
+        engine
     }
 
     #[test]
@@ -376,11 +435,65 @@ mod tests {
     }
 
     #[test]
+    fn a_write_in_flight_exposes_the_value_still_applied() {
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let engine = engine(vec![screen("DP-1", Some(85))]);
+        engine.lock()[0].queue = Some(Queue::silent(move |_| {
+            let _ = started.send(());
+            let _ = wait_release.recv_timeout(std::time::Duration::from_secs(5));
+            Ok(())
+        }));
+        let target = Target::Screen("DP-1".into());
+
+        engine.set(&target, Adjust::Absolute(60)).unwrap();
+        wait_started.recv().unwrap();
+        engine.set(&target, Adjust::Absolute(40)).unwrap();
+        let during = engine.screens().remove(0);
+        assert_eq!(during.status, Status::Busy);
+        assert_eq!((during.value, during.applied), (Some(40), Some(85)));
+
+        release.send(()).unwrap();
+        wait_started.recv().unwrap();
+        let during = engine.screens().remove(0);
+        assert_eq!((during.value, during.applied), (Some(40), Some(60)));
+
+        release.send(()).unwrap();
+        engine.finish_writes().unwrap();
+        let after = engine.screens().remove(0);
+        assert_eq!(after.status, Status::Ok);
+        assert_eq!((after.value, after.applied), (Some(40), None));
+    }
+
+    #[test]
+    fn a_failed_write_goes_back_to_the_real_value() {
+        let engine = engine(vec![screen("DP-1", Some(85))]);
+        engine.lock()[0].queue = Some(Queue::silent(|raw| match raw {
+            30 => Err(Error::Tool("DDC failed".into())),
+            _ => Ok(()),
+        }));
+        let target = Target::Screen("DP-1".into());
+
+        engine.set(&target, Adjust::Absolute(30)).unwrap();
+        engine.finish_writes().unwrap_err();
+        assert_eq!(engine.get("DP-1").unwrap(), "85\n");
+
+        assert_eq!(
+            engine.set(&target, Adjust::Relative(5)).unwrap(),
+            "DP-1\t90\n"
+        );
+        engine.finish_writes().unwrap();
+        assert_eq!(engine.get("DP-1").unwrap(), "90\n");
+        assert_eq!(engine.screens()[0].reason, None);
+    }
+
+    #[test]
     fn a_failed_write_shows_in_the_listing() {
         let mut entry = Entry {
             screen: screen("DP-1", Some(85)),
-            queue: Some(Queue::new(|_| Err(Error::Tool("DDC failed".into())))),
+            queue: Some(Queue::silent(|_| Err(Error::Tool("DDC failed".into())))),
             last_set: None,
+            applied: None,
         };
         let queue = entry.queue.take().unwrap();
         queue.submit(1);

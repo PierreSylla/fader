@@ -17,6 +17,7 @@ struct State {
     pending: Option<u32>,
     writing: bool,
     error: Option<String>,
+    written: Option<u32>,
     closed: bool,
 }
 
@@ -33,7 +34,10 @@ impl Shared {
 }
 
 impl Queue {
-    pub fn new(mut write: impl FnMut(u32) -> Result<(), Error> + Send + 'static) -> Self {
+    pub fn new(
+        mut write: impl FnMut(u32) -> Result<(), Error> + Send + 'static,
+        done: impl Fn() + Send + 'static,
+    ) -> Self {
         let shared = Arc::new(Shared::default());
         let worker = Arc::clone(&shared);
         std::thread::spawn(move || {
@@ -50,10 +54,19 @@ impl Queue {
                     value
                 };
                 let result = write(value);
-                let mut state = worker.lock();
-                state.writing = false;
-                state.error = result.err().map(|e| e.to_string());
+                {
+                    let mut state = worker.lock();
+                    state.writing = false;
+                    match result {
+                        Ok(()) => {
+                            state.written = Some(value);
+                            state.error = None;
+                        }
+                        Err(e) => state.error = Some(e.to_string()),
+                    }
+                }
                 worker.changed.notify_all();
+                done();
             }
         });
         Self { shared }
@@ -73,11 +86,26 @@ impl Queue {
         self.shared.lock().error.clone()
     }
 
+    pub fn written(&self) -> Option<u32> {
+        self.shared.lock().written
+    }
+
+    pub fn reset_written(&self) {
+        self.shared.lock().written = None;
+    }
+
     pub fn flush(&self) {
         let mut state = self.shared.lock();
         while state.writing || state.pending.is_some() {
             state = self.shared.wait(state);
         }
+    }
+}
+
+#[cfg(test)]
+impl Queue {
+    pub fn silent(write: impl FnMut(u32) -> Result<(), Error> + Send + 'static) -> Self {
+        Self::new(write, || {})
     }
 }
 
@@ -100,7 +128,7 @@ mod tests {
         let log = Arc::clone(&written);
         let (started, wait_started) = mpsc::channel();
         let (release, wait_release) = mpsc::channel::<()>();
-        let queue = Queue::new(move |value| {
+        let queue = Queue::silent(move |value| {
             log.lock().unwrap().push(value);
             started.send(()).unwrap();
             let _ = wait_release.recv_timeout(Duration::from_secs(5));
@@ -124,7 +152,7 @@ mod tests {
 
     #[test]
     fn keeps_the_last_error_until_a_write_succeeds() {
-        let queue = Queue::new(|value| match value {
+        let queue = Queue::silent(|value| match value {
             0 => Err(Error::Tool("failed".into())),
             _ => Ok(()),
         });
@@ -136,12 +164,13 @@ mod tests {
         queue.submit(1);
         queue.flush();
         assert_eq!(queue.error(), None);
+        assert_eq!(queue.written(), Some(1));
     }
 
     #[test]
     fn dropping_the_queue_still_writes_the_pending_value() {
         let (sent, received) = mpsc::channel();
-        let queue = Queue::new(move |value| {
+        let queue = Queue::silent(move |value| {
             sent.send(value).unwrap();
             Ok(())
         });
