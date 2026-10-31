@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+      }
+      div {
+        position: absolute;
+        inset: 20px;
+        background: rgb(255, 0, 255);
+        border-radius: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div></div>
+    <script>
+      addEventListener(
+        "keydown",
+        (e) => (document.title = "key " + e.key + " " + e.timeStamp),
+      );
+      addEventListener(
+        "mouseover",
+        (e) => (document.title = "pointer " + e.timeStamp),
+      );
+      addEventListener("blur", (e) => (document.title = "blur " + e.timeStamp));
+    </script>
+  </body>
+</html>

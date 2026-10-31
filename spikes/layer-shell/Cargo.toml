@@ -1,0 +1,16 @@
+# Spike jetable P0-3 : ne pas réutiliser tel quel.
+[package]
+name = "spike-layer-shell"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["custom-protocol"] }
+gtk = "0.18"
+gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
