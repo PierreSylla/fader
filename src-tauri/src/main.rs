@@ -1,67 +1,128 @@
+mod backlight;
+mod daemon;
 mod ddc;
+mod doctor;
+mod engine;
 mod hypr;
+mod i18n;
+mod queue;
 mod screens;
+mod tool;
 
-use gtk::prelude::*;
-use gtk_layer_shell::{KeyboardMode, Layer, LayerShell};
-use std::io::{self, BufRead, BufReader, ErrorKind, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use engine::{Adjust, Engine, Target};
+use i18n::{t, tf};
+use std::io::{self, ErrorKind, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
-use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
-const PANEL_WIDTH: i32 = 460;
-const PANEL_HEIGHT: i32 = 300;
-const USAGE: &str = "usage: fader <daemon|panel|list|get SCREEN>";
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
-enum Error {
-    #[error("XDG_RUNTIME_DIR is not set")]
+pub enum Error {
+    #[error("{}", t("XDG_RUNTIME_DIR is not set"))]
     NoRuntimeDir,
-    #[error("fader daemon is already running")]
+    #[error("{}", t("fader daemon is already running"))]
     AlreadyRunning,
-    #[error("fader daemon is not running, start it with: fader daemon")]
+    #[error("{}", t("fader daemon is not running, start it with: fader daemon"))]
     NotRunning,
-    #[error("cannot connect to a Wayland display")]
+    #[error("{}", t("cannot connect to a Wayland display"))]
     NoDisplay,
-    #[error("this compositor does not support the layer-shell protocol")]
+    #[error("{}", t("this compositor does not support the layer-shell protocol"))]
     NoLayerShell,
-    #[error("cannot reach Hyprland, is it running in this session?")]
+    #[error("{}", t("cannot reach Hyprland, is it running in this session?"))]
     NoHyprland,
-    #[error("unexpected reply from Hyprland: {0}")]
+    #[error("{}", tf("unexpected reply from Hyprland: {}", .0))]
     HyprlandReply(serde_json::Error),
-    #[error("ddcutil is not installed")]
-    NoDdcutil,
-    #[error("ddcutil did not answer in time")]
-    DdcTimeout,
+    #[error("{}", tf("{} is not installed", .0))]
+    ToolMissing(&'static str),
+    #[error("{}", tf("{} did not answer in time", .0))]
+    ToolTimeout(&'static str),
     #[error("{0}")]
-    Ddc(String),
-    #[error("unknown screen: {0}")]
+    Tool(String),
+    #[error("{}", tf("unknown screen: {}", .0))]
     UnknownScreen(String),
     #[error("{id}: {reason}")]
     ScreenUnavailable { id: String, reason: String },
+    #[error("{0}")]
+    SetFailed(String),
+    #[error("{}", tf("invalid request: {}", .0))]
+    BadRequest(String),
+    #[error("{0}")]
+    Daemon(String),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
     Tauri(#[from] tauri::Error),
 }
 
+#[derive(Debug, PartialEq)]
+pub enum Request {
+    Daemon,
+    Doctor,
+    Panel,
+    List,
+    Get(String),
+    Set(Target, Adjust),
+}
+
+impl Request {
+    pub fn parse(words: &[&str]) -> Option<Self> {
+        Some(match *words {
+            ["daemon"] => Request::Daemon,
+            ["doctor"] => Request::Doctor,
+            ["panel"] => Request::Panel,
+            ["list"] => Request::List,
+            ["get", screen] => Request::Get(screen.to_owned()),
+            ["set", target, value] => {
+                let target = match target {
+                    "focused" => Target::Focused,
+                    "all" => Target::All,
+                    screen => Target::Screen(screen.to_owned()),
+                };
+                Request::Set(target, Adjust::parse(value)?)
+            }
+            _ => return None,
+        })
+    }
+
+    pub fn execute(&self, engine: &Engine) -> Result<String, Error> {
+        match self {
+            Request::List => Ok(engine.list()),
+            Request::Get(id) => engine.get(id),
+            Request::Set(target, adjust) => engine.set(target, *adjust),
+            _ => Err(Error::BadRequest(format!("{self:?}"))),
+        }
+    }
+
+    fn only_screen(&self) -> Option<&str> {
+        match self {
+            Request::Get(id) | Request::Set(Target::Screen(id), _) => Some(id),
+            _ => None,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        ["daemon"] => daemon(),
-        ["panel"] => send("panel"),
-        ["list"] => list(),
-        ["get", screen] => get(screen),
-        _ => {
-            eprintln!("{USAGE}");
-            return ExitCode::from(2);
-        }
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Some(request) = Request::parse(&words) else {
+        eprintln!("{}", t(i18n::USAGE));
+        return ExitCode::from(2);
     };
+    let result = match request {
+        Request::Daemon => daemon::run().map(|()| String::new()),
+        Request::Doctor => doctor::run(),
+        Request::Panel => send(&words.join(" ")),
+        request => match send(&words.join(" ")) {
+            Err(Error::NotRunning) => direct(&request),
+            reply => reply,
+        },
+    };
+    let result = result.and_then(|body| Ok(io::stdout().write_all(body.as_bytes())?));
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        // `fader list | head` : le lecteur a fini, ce n'est pas une erreur.
         Err(Error::Io(e)) if e.kind() == ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("fader: {e}");
@@ -70,124 +131,36 @@ fn main() -> ExitCode {
     }
 }
 
-fn list() -> Result<(), Error> {
-    let mut out = io::stdout().lock();
-    for s in screens::read(None)? {
-        let value = s.value.map_or("-".to_owned(), |v| format!("{v}%"));
-        let reason = s
-            .reason
-            .map_or(String::new(), |r| format!("\t{}", r.replace('\n', " ")));
-        writeln!(
-            out,
-            "{}\t{}\t{}\t{value}\t{}{reason}",
-            s.id, s.label, s.backend, s.status
-        )?;
-    }
-    Ok(())
+fn direct(request: &Request) -> Result<String, Error> {
+    let engine = Engine::default();
+    engine.refresh(request.only_screen())?;
+    let output = request.execute(&engine)?;
+    engine.finish_writes()?;
+    Ok(output)
 }
 
-fn get(id: &str) -> Result<(), Error> {
-    for s in screens::read(Some(id))? {
-        let Some(value) = s.value else {
-            let reason = s.reason.unwrap_or_else(|| s.status.to_string());
-            return Err(Error::ScreenUnavailable { id: s.id, reason });
-        };
-        writeln!(io::stdout(), "{value}")?;
-    }
-    Ok(())
-}
-
-fn socket_path() -> Result<PathBuf, Error> {
+pub fn socket_path() -> Result<PathBuf, Error> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or(Error::NoRuntimeDir)?;
     Ok(PathBuf::from(dir).join("fader.sock"))
 }
 
-fn send(command: &str) -> Result<(), Error> {
+fn send(command: &str) -> Result<String, Error> {
     let mut stream = UnixStream::connect(socket_path()?).map_err(|e| match e.kind() {
         ErrorKind::NotFound | ErrorKind::ConnectionRefused => Error::NotRunning,
         _ => e.into(),
     })?;
+    stream.set_read_timeout(Some(CLIENT_TIMEOUT))?;
     writeln!(stream, "{command}")?;
-    Ok(())
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    parse_reply(&reply)
 }
 
-fn bind_socket(path: &Path) -> Result<UnixListener, Error> {
-    if UnixStream::connect(path).is_ok() {
-        return Err(Error::AlreadyRunning);
-    }
-    match std::fs::remove_file(path) {
-        Err(e) if e.kind() != ErrorKind::NotFound => return Err(e.into()),
-        _ => {}
-    }
-    Ok(UnixListener::bind(path)?)
-}
-
-fn daemon() -> Result<(), Error> {
-    gtk::init().map_err(|_| Error::NoDisplay)?;
-    let listener = bind_socket(&socket_path()?)?;
-
-    tauri::Builder::default()
-        .setup(move |app| {
-            if !gtk_layer_shell::is_supported() {
-                return Err(Error::NoLayerShell.into());
-            }
-            let panel = create_panel(app)?;
-            std::thread::spawn(move || serve(&listener, &panel));
-            Ok(())
-        })
-        .run(tauri::generate_context!())?;
-    Ok(())
-}
-
-fn create_panel(app: &tauri::App) -> Result<WebviewWindow, Error> {
-    let panel = WebviewWindowBuilder::new(app, "panel", WebviewUrl::default())
-        .title("Fader")
-        .visible(false)
-        .decorations(false)
-        .transparent(true)
-        .build()?;
-    let gtk = panel.gtk_window()?;
-    gtk.init_layer_shell();
-    gtk.set_namespace("fader-panel");
-    gtk.set_layer(Layer::Overlay);
-    gtk.set_size_request(PANEL_WIDTH, PANEL_HEIGHT);
-    gtk.connect_focus_in_event(|window, _| {
-        if window.keyboard_mode() == KeyboardMode::Exclusive {
-            window.set_keyboard_mode(KeyboardMode::OnDemand);
-        }
-        gtk::glib::Propagation::Proceed
-    });
-    close_panel(&panel, &gtk);
-    gtk.show_all();
-    Ok(panel)
-}
-
-fn toggle_panel(panel: &WebviewWindow) {
-    let Ok(gtk) = panel.gtk_window() else { return };
-    if gtk.keyboard_mode() == KeyboardMode::None {
-        gtk.input_shape_combine_region(None);
-        gtk.set_keyboard_mode(KeyboardMode::Exclusive);
-        let _ = panel.eval("document.documentElement.toggleAttribute('data-open', true)");
-    } else {
-        close_panel(panel, &gtk);
-    }
-}
-
-fn close_panel(panel: &WebviewWindow, gtk: &gtk::ApplicationWindow) {
-    gtk.input_shape_combine_region(Some(&gtk::cairo::Region::create()));
-    gtk.set_keyboard_mode(KeyboardMode::None);
-    let _ = panel.eval("document.documentElement.toggleAttribute('data-open', false)");
-}
-
-fn serve(listener: &UnixListener, panel: &WebviewWindow) {
-    for stream in listener.incoming().flatten() {
-        // Un client muet ne doit pas bloquer les suivants.
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-        let mut line = String::new();
-        if BufReader::new(stream).read_line(&mut line).is_ok() && line.trim() == "panel" {
-            let panel_on_main = panel.clone();
-            let _ = panel.run_on_main_thread(move || toggle_panel(&panel_on_main));
-        }
+fn parse_reply(reply: &str) -> Result<String, Error> {
+    match reply.split_once('\n') {
+        Some(("ok", body)) => Ok(body.to_owned()),
+        Some(("err", message)) => Err(Error::Daemon(message.to_owned())),
+        _ => Err(Error::Daemon(reply.to_owned())),
     }
 }
 
@@ -196,16 +169,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bind_socket_replaces_stale_file_and_refuses_live_daemon() {
-        let path = std::env::temp_dir().join(format!("fader-test-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+    fn parses_requests() {
+        assert_eq!(Request::parse(&["list"]), Some(Request::List));
+        assert_eq!(
+            Request::parse(&["set", "focused", "+5"]),
+            Some(Request::Set(Target::Focused, Adjust::Relative(5)))
+        );
+        assert_eq!(
+            Request::parse(&["set", "all", "40"]),
+            Some(Request::Set(Target::All, Adjust::Absolute(40)))
+        );
+        assert_eq!(
+            Request::parse(&["set", "DP-1", "-5"]),
+            Some(Request::Set(
+                Target::Screen("DP-1".into()),
+                Adjust::Relative(-5)
+            ))
+        );
+        assert_eq!(Request::parse(&["set", "DP-1", "300"]), None);
+        assert_eq!(Request::parse(&["set", "DP-1"]), None);
+        assert_eq!(Request::parse(&[]), None);
+    }
 
-        std::fs::write(&path, "").unwrap();
-        let live = bind_socket(&path).unwrap();
-        assert!(matches!(bind_socket(&path), Err(Error::AlreadyRunning)));
-
-        drop(live);
-        assert!(bind_socket(&path).is_ok());
-        std::fs::remove_file(&path).unwrap();
+    #[test]
+    fn parses_daemon_replies() {
+        assert_eq!(parse_reply("ok\nDP-1\t50\n").unwrap(), "DP-1\t50\n");
+        assert_eq!(parse_reply("ok\n").unwrap(), "");
+        assert!(matches!(parse_reply("err\nnope"), Err(Error::Daemon(m)) if m == "nope"));
+        assert!(matches!(parse_reply(""), Err(Error::Daemon(_))));
     }
 }

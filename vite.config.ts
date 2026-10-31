@@ -3,7 +3,6 @@ import { defineConfig } from "vite";
 
 export default defineConfig({
   plugins: [svelte()],
-  // Tauri attend un port fixe (devUrl) et affiche ses erreurs Rust dans le même terminal.
   clearScreen: false,
   server: {
     port: 1420,

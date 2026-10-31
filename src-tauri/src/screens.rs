@@ -1,9 +1,12 @@
+use crate::ddc::Brightness;
 use crate::hypr::Monitor;
-use crate::{Error, ddc, hypr};
+use crate::i18n::t;
+use crate::{Error, backlight, ddc, hypr};
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Backend {
+    Backlight { device: String },
     Ddc { bus: u32 },
     None,
 }
@@ -11,23 +14,32 @@ pub enum Backend {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Status {
     Ok,
+    Busy,
     Unreachable,
     Permission,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Screen {
     pub id: String,
     pub label: String,
     pub backend: Backend,
     pub value: Option<u8>,
+    pub max: Option<u32>,
     pub status: Status,
     pub reason: Option<String>,
+}
+
+impl Screen {
+    pub fn writable(&self) -> bool {
+        self.backend != Backend::None
+    }
 }
 
 impl fmt::Display for Backend {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
+            Backend::Backlight { .. } => "backlight",
             Backend::Ddc { .. } => "ddc",
             Backend::None => "none",
         })
@@ -38,6 +50,7 @@ impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
             Status::Ok => "ok",
+            Status::Busy => "busy",
             Status::Unreachable => "unreachable",
             Status::Permission => "permission",
         })
@@ -52,8 +65,11 @@ pub fn read(only: Option<&str>) -> Result<Vec<Screen>, Error> {
     if let (Some(id), true) = (only, monitors.is_empty()) {
         return Err(Error::UnknownScreen(id.to_owned()));
     }
-    let detected = ddc::detect();
-    // Un `getvcp` prend environ 245 ms (ADR-0003) : les écrans sont lus en parallèle.
+    let detected = if monitors.iter().all(|m| backlight::is_internal(&m.name)) {
+        Ok(Vec::new())
+    } else {
+        ddc::detect()
+    };
     Ok(std::thread::scope(|scope| {
         let readers: Vec<_> = monitors
             .iter()
@@ -67,56 +83,78 @@ pub fn read(only: Option<&str>) -> Result<Vec<Screen>, Error> {
             .zip(&monitors)
             .map(|(reader, monitor)| {
                 reader.join().unwrap_or_else(|_| {
-                    unavailable(
-                        monitor,
-                        Backend::None,
-                        Status::Unreachable,
-                        "internal error".to_owned(),
-                    )
+                    let reason = t("internal error").to_owned();
+                    unavailable(monitor, Backend::None, Status::Unreachable, reason)
                 })
             })
             .collect()
     }))
 }
 
+pub fn read_value(backend: &Backend) -> Result<Brightness, Error> {
+    match backend {
+        Backend::Backlight { device } => backlight::get(device),
+        Backend::Ddc { bus } => ddc::get(*bus),
+        Backend::None => Err(Error::Tool(t("no brightness backend found").to_owned())),
+    }
+}
+
+pub fn write(backend: &Backend, raw: u32) -> Result<(), Error> {
+    match backend {
+        Backend::Backlight { device } => backlight::set(device, raw),
+        Backend::Ddc { bus } => ddc::set(*bus, raw),
+        Backend::None => Err(Error::Tool(t("no brightness backend found").to_owned())),
+    }
+}
+
 fn read_screen(monitor: &Monitor, detected: &Result<Vec<ddc::Display>, Error>) -> Screen {
     if monitor.disabled {
-        return unavailable(
-            monitor,
-            Backend::None,
-            Status::Unreachable,
-            "output is disabled".to_owned(),
-        );
-    }
-    let displays = match detected {
-        Ok(displays) => displays,
-        Err(e) => {
-            return unavailable(
-                monitor,
-                Backend::None,
-                status_of(&e.to_string()),
-                e.to_string(),
-            );
-        }
-    };
-    let Some(display) = find_display(monitor, displays) else {
-        let reason = "no brightness backend found".to_owned();
+        let reason = t("output is disabled").to_owned();
         return unavailable(monitor, Backend::None, Status::Unreachable, reason);
-    };
-    let backend = Backend::Ddc { bus: display.bus };
-    if let Some(problem) = &display.problem {
-        return unavailable(monitor, backend, status_of(problem), problem.clone());
     }
-    match ddc::get(display.bus) {
+    let backend = match find_backend(monitor, detected) {
+        Ok(backend) => backend,
+        Err(screen) => return *screen,
+    };
+    match read_value(&backend) {
         Ok(brightness) => Screen {
             id: monitor.name.clone(),
             label: monitor.label(),
             backend,
             value: Some(brightness.percent()),
+            max: Some(brightness.max),
             status: Status::Ok,
             reason: None,
         },
         Err(e) => unavailable(monitor, backend, status_of(&e.to_string()), e.to_string()),
+    }
+}
+
+fn find_backend(
+    monitor: &Monitor,
+    detected: &Result<Vec<ddc::Display>, Error>,
+) -> Result<Backend, Box<Screen>> {
+    let none = |status, reason| Box::new(unavailable(monitor, Backend::None, status, reason));
+    let no_backend = || t("no brightness backend found").to_owned();
+    if backlight::is_internal(&monitor.name) {
+        return backlight::find()
+            .map(|device| Backend::Backlight { device })
+            .ok_or_else(|| none(Status::Unreachable, no_backend()));
+    }
+    let displays = detected
+        .as_ref()
+        .map_err(|e| none(status_of(&e.to_string()), e.to_string()))?;
+    let display =
+        find_display(monitor, displays).ok_or_else(|| none(Status::Unreachable, no_backend()))?;
+    let backend = Backend::Ddc { bus: display.bus };
+    match &display.problem {
+        Some(problem) => Err(Box::new(unavailable(
+            monitor,
+            backend,
+            status_of(problem),
+            problem.clone(),
+        ))),
+        None => Ok(backend),
     }
 }
 
@@ -134,7 +172,7 @@ fn find_display<'a>(monitor: &Monitor, displays: &'a [ddc::Display]) -> Option<&
         })
 }
 
-fn status_of(message: &str) -> Status {
+pub fn status_of(message: &str) -> Status {
     if message.contains("i2c_permissions") || message.contains("Permission denied") {
         Status::Permission
     } else {
@@ -148,6 +186,7 @@ fn unavailable(monitor: &Monitor, backend: Backend, status: Status, reason: Stri
         label: monitor.label(),
         backend,
         value: None,
+        max: None,
         status,
         reason: Some(reason),
     }
@@ -163,6 +202,7 @@ mod tests {
             make: "AOC".into(),
             model: "Q27B35E".into(),
             serial: serial.into(),
+            focused: false,
             disabled: false,
         }
     }

@@ -11,7 +11,6 @@ export default defineConfig(
   {
     files: ["**/*.svelte"],
     languageOptions: { parserOptions: { parser: tseslint.parser } },
-    // svelte-check vérifie déjà les noms inconnus, sans liste de globales à maintenir.
     rules: { "no-undef": "off" },
   },
 );

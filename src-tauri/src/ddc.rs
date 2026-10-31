@@ -1,10 +1,4 @@
-use crate::Error;
-use std::io::ErrorKind;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
-
-const TIMEOUT: Duration = Duration::from_secs(5);
-const POLL: Duration = Duration::from_millis(5);
+use crate::{Error, tool};
 
 #[derive(Debug, PartialEq)]
 pub struct Display {
@@ -17,55 +11,34 @@ pub struct Display {
 
 #[derive(Debug, PartialEq)]
 pub struct Brightness {
-    pub current: u16,
-    pub max: u16,
+    pub current: u32,
+    pub max: u32,
 }
 
 impl Brightness {
     pub fn percent(&self) -> u8 {
-        let percent =
-            (u32::from(self.current) * 100 + u32::from(self.max) / 2) / u32::from(self.max);
-        percent.min(100) as u8
+        let (current, max) = (u64::from(self.current), u64::from(self.max));
+        ((current * 100 + max / 2) / max).min(100) as u8
     }
 }
 
 pub fn detect() -> Result<Vec<Display>, Error> {
-    Ok(parse_detect(&run(&["detect"])?))
+    Ok(parse_detect(&tool::run("ddcutil", &["detect"])?))
 }
 
 pub fn get(bus: u32) -> Result<Brightness, Error> {
     let bus = bus.to_string();
-    let output = run(&["--bus", &bus, "--brief", "getvcp", "10"])?;
-    parse_brightness(&output).ok_or_else(|| Error::Ddc(output.trim().to_owned()))
+    let output = tool::run("ddcutil", &["--bus", &bus, "--brief", "getvcp", "10"])?;
+    parse_brightness(&output).ok_or_else(|| Error::Tool(output.trim().to_owned()))
 }
 
-fn run(args: &[&str]) -> Result<String, Error> {
-    let mut child = Command::new("ddcutil")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| match e.kind() {
-            ErrorKind::NotFound => Error::NoDdcutil,
-            _ => e.into(),
-        })?;
-    let deadline = Instant::now() + TIMEOUT;
-    while child.try_wait()?.is_none() {
-        if Instant::now() >= deadline {
-            child.kill()?;
-            child.wait()?;
-            return Err(Error::DdcTimeout);
-        }
-        std::thread::sleep(POLL);
-    }
-    let output = child.wait_with_output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    if output.status.success() {
-        return Ok(stdout);
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(Error::Ddc(format!("{stdout}{stderr}").trim().to_owned()))
+pub fn set(bus: u32, raw: u32) -> Result<(), Error> {
+    let (bus, raw) = (bus.to_string(), raw.to_string());
+    tool::run(
+        "ddcutil",
+        &["--bus", &bus, "setvcp", "10", &raw, "--noverify"],
+    )?;
+    Ok(())
 }
 
 fn parse_brightness(output: &str) -> Option<Brightness> {
