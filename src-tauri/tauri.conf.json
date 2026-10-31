@@ -10,13 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "title": "Fader",
-        "width": 800,
-        "height": 600
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost",
       "devCsp": "default-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:1420 ws://127.0.0.1:1420 ipc: http://ipc.localhost"
