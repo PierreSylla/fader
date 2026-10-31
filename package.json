@@ -8,8 +8,8 @@
     "dev": "vite dev",
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "lint": "eslint . && prettier --check .",
-    "format": "prettier --write .",
+    "lint": "eslint . && prettier --check . \"!*.md\"",
+    "format": "prettier --write . \"!*.md\"",
     "tauri": "tauri"
   },
   "devDependencies": {
